@@ -1,35 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
+import * as XLSX from 'xlsx'
 import './ResponsePage.css'
 
 const SHEET_ID = '1cAUk4LWtRc3_Ems2_oWUAqmLBy8JB72jhx_GalpUkkw'
-const SHEET_GID = '0'
-
-function parseGoogleVisualizationResponse(rawText) {
-  const start = rawText.indexOf('{')
-  const end = rawText.lastIndexOf('}')
-
-  if (start === -1 || end === -1 || start >= end) {
-    throw new Error('Invalid response format from Google Sheet.')
-  }
-
-  const json = rawText.slice(start, end + 1)
-  return JSON.parse(json)
-}
 
 function getCellValue(cell) {
-  if (!cell) {
+  if (cell === null || cell === undefined) {
     return ''
   }
 
-  if (cell.f) {
-    return cell.f
-  }
-
-  if (cell.v === null || cell.v === undefined) {
-    return ''
-  }
-
-  return String(cell.v)
+  return String(cell)
 }
 
 function isValidUrl(value) {
@@ -133,9 +113,10 @@ function AttachmentList({ value }) {
 }
 
 export default function ResponsePage() {
-  const [sheetData, setSheetData] = useState({ columns: [], rows: [] })
+  const [sheetTables, setSheetTables] = useState([])
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState('')
+  const [warning, setWarning] = useState('')
 
   useEffect(() => {
     let isMounted = true
@@ -144,28 +125,68 @@ export default function ResponsePage() {
       try {
         setIsLoading(true)
         setError('')
+        setWarning('')
 
-        const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?gid=${SHEET_GID}&headers=1&tqx=out:json`
+        const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=xlsx`
         const response = await fetch(url)
 
         if (!response.ok) {
           throw new Error(`Unable to fetch sheet data (HTTP ${response.status}).`)
         }
 
-        const rawText = await response.text()
-        const parsed = parseGoogleVisualizationResponse(rawText)
-        const table = parsed.table || { cols: [], rows: [] }
+        const workbookBuffer = await response.arrayBuffer()
+        const workbook = XLSX.read(workbookBuffer, { type: 'array' })
+        const failedSheets = []
+        const tables = workbook.SheetNames.reduce((acc, sheetName) => {
+          try {
+            const worksheet = workbook.Sheets[sheetName]
 
-        const columns = (table.cols || []).map((col, index) => {
-          return col.label || col.id || `Column ${index + 1}`
-        })
+            if (!worksheet) {
+              failedSheets.push(sheetName)
+              return acc
+            }
 
-        const rows = (table.rows || []).map((row) => {
-          return (row.c || []).map(getCellValue)
-        })
+            const sheetRows = XLSX.utils.sheet_to_json(worksheet, {
+              header: 1,
+              raw: false,
+              defval: '',
+              blankrows: false,
+            })
+
+            const normalizedRows = sheetRows
+              .filter((row) => Array.isArray(row))
+              .map((row) => row.map(getCellValue))
+
+            const [headerRow = [], ...dataRows] = normalizedRows
+            const maxColumnCount = Math.max(
+              headerRow.length,
+              ...dataRows.map((row) => row.length),
+            )
+
+            const columns = Array.from({ length: maxColumnCount }, (_, index) => {
+              const value = getCellValue(headerRow[index]).trim()
+              return value || `Column ${index + 1}`
+            })
+
+            acc.push({
+              sheetName,
+              columns,
+              rows: dataRows,
+            })
+
+            return acc
+          } catch {
+            failedSheets.push(sheetName)
+            return acc
+          }
+        }, [])
 
         if (isMounted) {
-          setSheetData({ columns, rows })
+          setSheetTables(tables)
+
+          if (failedSheets.length > 0) {
+            setWarning(`Some worksheets could not be rendered: ${failedSheets.join(', ')}`)
+          }
         }
       } catch (loadError) {
         if (isMounted) {
@@ -185,7 +206,13 @@ export default function ResponsePage() {
     }
   }, [])
 
-  const hasRows = useMemo(() => sheetData.rows.length > 0, [sheetData.rows.length])
+  const hasAnyRows = useMemo(() => {
+    return sheetTables.some((table) => table.rows.length > 0)
+  }, [sheetTables])
+
+  const hasAnySheet = useMemo(() => {
+    return sheetTables.length > 0
+  }, [sheetTables])
 
   return (
     <main className="response-page">
@@ -204,32 +231,53 @@ export default function ResponsePage() {
           </p>
         )}
 
-        {!isLoading && !error && !hasRows && (
-          <p className="status">No rows found in this sheet.</p>
+        {!isLoading && !error && warning && <p className="status">{warning}</p>}
+
+        {!isLoading && !error && !hasAnySheet && (
+          <p className="status">No worksheets found in this spreadsheet.</p>
         )}
 
-        {!isLoading && !error && hasRows && (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  {sheetData.columns.map((column) => (
-                    <th key={column}>{column}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {sheetData.rows.map((row, rowIndex) => (
-                  <tr key={`row-${rowIndex}`}>
-                    {row.map((cellValue, cellIndex) => (
-                      <td key={`cell-${rowIndex}-${cellIndex}`}>
-                        <AttachmentList value={cellValue} />
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+        {!isLoading && !error && hasAnySheet && !hasAnyRows && (
+          <p className="status">No rows found in any worksheet.</p>
+        )}
+
+        {!isLoading && !error && hasAnySheet && (
+          <div className="sheet-list">
+            {sheetTables.map((sheetTable) => {
+              const hasRows = sheetTable.rows.length > 0
+
+              return (
+                <article className="sheet-section" key={sheetTable.sheetName}>
+                  <h2>{sheetTable.sheetName}</h2>
+                  {!hasRows ? (
+                    <p className="status">No rows in this worksheet.</p>
+                  ) : (
+                    <div className="table-wrap">
+                      <table>
+                        <thead>
+                          <tr>
+                            {sheetTable.columns.map((column, index) => (
+                              <th key={`${sheetTable.sheetName}-${index}`}>{column}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {sheetTable.rows.map((row, rowIndex) => (
+                            <tr key={`${sheetTable.sheetName}-row-${rowIndex}`}>
+                              {sheetTable.columns.map((_, cellIndex) => (
+                                <td key={`${sheetTable.sheetName}-cell-${rowIndex}-${cellIndex}`}>
+                                  <AttachmentList value={row[cellIndex] || ''} />
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </article>
+              )
+            })}
           </div>
         )}
       </section>
